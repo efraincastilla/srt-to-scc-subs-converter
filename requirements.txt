@@ -1,0 +1,2 @@
+pycaption==1.0.1
+beautifulsoup==4.4.1
