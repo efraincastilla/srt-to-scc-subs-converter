@@ -1,85 +1,76 @@
-import boto3
+#!/usr/bin/env python
+
+import glob
+import json
 import os
-import sys
-import pycaption
-import subprocess
-import logging
+import uuid
+import boto3
+import datetime
+import random
 
-client = boto3.client('s3')
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+from botocore.client import ClientError
 
-tmpPrefix = os.environ['TmpPath']
-destPrefix = os.environ['DestPath']
+def handler(event, context):
 
-def lambda_handler(event, context):
-    for rec in event['Records']:
-        s3 = rec['s3']
-        fileS3Path = s3['bucket']['name']
-        fileS3Key = s3['object']['key']
-
-        # Needed when a delete event on a srt file
-        if '.scc' in fileS3Key:
-            logger.debug("found .scc in key {0}".format(fileS3Key))
-            fileS3Key = fileS3Key.replace('scc', 'srt')
-
-        inputFile = download_srt(fileS3Path, fileS3Key)
-        outputFile = os.path.splitext(inputFile)[0] + '.scc'
-        convert_srt_2_scc(inputFile, outputFile)
-        upload_scc(outputFile, fileS3Path)
-
-    logger.info("{0} records processed.".format(len(event['Records'])))
-    return True
-
-def download_srt(file_path, file_key):
-    tmp_srt_file = tmpPrefix + "/" + file_key
-    directory = os.path.dirname(tmp_srt_file)
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-    print("key=", file_key)
-    print("tmp_srt_file=", tmp_srt_file)
-    client.download_file(file_path, file_key, tmp_srt_file)
+    assetID = str(uuid.uuid4())
+    sourceS3Bucket = event['Records'][0]['s3']['bucket']['name']
+    sourceS3Key = event['Records'][0]['s3']['object']['key']
+    sourceS3 = 's3://'+ sourceS3Bucket + '/' + sourceS3Key
+    sourceSCCKey = 's3://'+ sourceS3Bucket + '/' + os.path.splitext(sourceS3Key)[0] + '.scc'
+    sourceSCCKey = sourceSCCKey.replace('inputs','outputs')
+    print("sourceSCCKey=", sourceSCCKey)
+    sourceS3Basename = os.path.splitext(os.path.basename(sourceS3))[0]
+    destinationS3 = 's3://' + os.environ['DestinationBucket']
+    #destinationS3basename = os.path.splitext(os.path.basename(destinationS3))[0]
+    mediaConvertRole = os.environ['MediaConvertRole']
+    region = os.environ['AWS_DEFAULT_REGION']
+    statusCode = 200
+    body = {}
     
-    output = subprocess.check_output(["file", tmp_srt_file])
-    logger.debug("srt file downloaded to {}".format(str(output, "utf-8")))
-    return tmp_srt_file
+    # Use MediaConvert SDK UserMetadata to tag jobs with the assetID 
+    # Events from MediaConvert will have the assetID in UserMedata
+    jobMetadata = {'assetID': assetID}
 
-def convert_srt_2_scc(input_file, output_file):
+    print (json.dumps(event))
     
-    logger.debug('Start convert_srt_2_scc')
-    print('input_file=',input_file)
-    print('output_file=',output_file)
-    
-    try:       
-        srt_file = open(input_file, 'rb')
-        scc_file = open(output_file, 'w')
-        scc_file.write(convert_file(srt_file.read().decode('ascii', 'ignore'), pycaption.SCCWriter()))
-        scc_file.close()
+    try:
+        # Job settings are in the lambda zip file in the current working directory
+        with open('job.json') as json_data:
+            jobSettings = json.load(json_data)
+            print(jobSettings)
         
-        print ("End convert_srt_2_scc")
-    
+        # get the account-specific mediaconvert endpoint for this region
+        mc_client = boto3.client('mediaconvert', region_name=region)
+        endpoints = mc_client.describe_endpoints()
+
+        # add the account-specific endpoint to the client session 
+        client = boto3.client('mediaconvert', region_name=region, endpoint_url=endpoints['Endpoints'][0]['Url'], verify=False)
+
+        # Update the job settings with the source video from the S3 event and destination 
+        # paths for converted videos
+        jobSettings['Inputs'][0]['FileInput'] = sourceS3
+        jobSettings['Inputs'][0]['CaptionSelectors']['Captions Selector 1']['SourceSettings']\
+            ['FileSourceSettings']['SourceFile']= sourceSCCKey
+        
+        S3KeyFile = 'outputs/' + assetID + '/TS/' + sourceS3Basename
+        jobSettings['OutputGroups'][0]['OutputGroupSettings']['FileGroupSettings']['Destination'] \
+            = destinationS3 + '/' + S3KeyFile
+        
+        print('jobSettings:')
+        print(json.dumps(jobSettings))
+
+        # Convert the video using AWS Elemental MediaConvert
+        job = client.create_job(Role=mediaConvertRole, UserMetadata=jobMetadata, Settings=jobSettings)
+        print (json.dumps(job, default=str))
+
     except Exception as e:
-            import pdb; pdb.post_mortem(sys.exc_info()[2])
-            logging.error('Unable to convert %s: %s', input_file, e)
-            srt_file.close()
-            scc_file.close()
-            raise
+        print ('Exception: %s' % e)
+        statusCode = 500
+        raise
 
-def upload_scc(output_file, file_path):
-    basename = os.path.basename(output_file)
-    full_key = "{0}/{1}".format(destPrefix, basename)
-    logger.debug('uploading to S3 bucket: {}, key: {}'.format(file_path, full_key))
-    client.upload_file(output_file, file_path, full_key)
-
-def convert_file(input_captions, output_writer):
-    print("Start convert_file")
-    reader = pycaption.detect_format(input_captions)
-    logger.debug(reader)
-
-    if not reader:
-        raise RuntimeError('Unrecognized format')
-
-    converter = pycaption.CaptionConverter()
-    converter.read(input_captions, reader())
-    return converter.write(output_writer)
+    finally:
+        return {
+            'statusCode': statusCode,
+            'body': json.dumps(body),
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
+        }
